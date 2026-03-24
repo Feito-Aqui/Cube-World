@@ -204,7 +204,7 @@ bool openGifByIndex(size_t index) {
 
   closeCurrentGif();
 
-  gfx->fillScreen(BLACK);
+  // gfx->fillScreen(BLACK);
 
   const String &path = gifPaths[index];
   Serial.printf("Opening GIF: %s\r\n", path.c_str());
@@ -333,6 +333,15 @@ void initGifPlayer() {
 
 }  // namespace
 
+int findGifIndexByName(const String &filename) {
+  for (size_t i = 0; i < gifCount; i++) {
+    if (gifPaths[i].endsWith(filename)) {
+      return i;
+    }
+  }
+  return -1; // Não encontrou
+}
+
 void setup() {
   waitForUsbSerial();
 
@@ -365,12 +374,28 @@ void loop() {
     if (now >= nextFrameAtMs) {
       int frameDelayMs = 0;
       const int result = gif.playFrame(false, &frameDelayMs);
+      
       if (result < 0) {
         Serial.printf("GIF decode error: %d\r\n", gif.getLastError());
         openGifByIndex(currentGifIndex);
-      } else if (result == 0) {
-        restartCurrentGif();
-      } else {
+      } 
+      else if (result == 0) {
+        // --- INÍCIO DA MUDANÇA ---
+        // Se o GIF que acabou de terminar for o Sleep_240.gif
+        if (gifPaths[currentGifIndex].endsWith("/wakeUp_240.gif")) {
+          int defaultIndex = findGifIndexByName("/default.gif");
+          
+          if (defaultIndex >= 0) {
+            openGifByIndex(defaultIndex); // Troca automaticamente para o default.gif
+          } else {
+            restartCurrentGif(); // Prevenção de erro: se default.gif não existir, repete o atual
+          }
+        } else {
+          restartCurrentGif(); // Comportamento normal para os outros GIFs: fica em loop
+        }
+        // --- FIM DA MUDANÇA ---
+      } 
+      else {
         if (frameDelayMs < 10) {
           frameDelayMs = 10;
         }
