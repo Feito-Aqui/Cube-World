@@ -72,6 +72,7 @@ size_t gifCount = 0;
 size_t currentGifIndex = 0;
 bool gifIsOpen = false;
 bool imuReady = false;
+bool leftTurnTransitionPending = false;
 int16_t gifOffsetX = 0;
 int16_t gifOffsetY = 0;
 uint16_t lineBuffer[kLineBufferSize];
@@ -80,6 +81,8 @@ uint32_t nextFrameAtMs = 0;
 uint32_t lastImuPollMs = 0;
 uint32_t orientationChangedAtMs = 0;
 ScreenOrientation currentOrientation = ScreenOrientation::Portrait;
+ScreenOrientation pendingOrientation = ScreenOrientation::Portrait;
+int pendingDefaultGifIndex = -1;
 
 void onTouchInterrupt();
 void gifDraw(GIFDRAW *draw);
@@ -87,7 +90,10 @@ void closeCurrentGif();
 bool openGifByIndex(size_t index);
 void restartCurrentGif();
 void drawOrientationBadge();
-void applyDisplayOrientation(ScreenOrientation orientation, bool force = false);
+void applyDisplayOrientation(ScreenOrientation orientation, bool force = false, bool reopenGif = true);
+bool startLeftTurnTransition(ScreenOrientation nextOrientation);
+int findGifIndexByName(const String &filename);
+bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 
 uint8_t displayRotationForOrientation(ScreenOrientation orientation) {
   switch (orientation) {
@@ -409,6 +415,10 @@ bool openGifByIndex(size_t index) {
 }
 
 void showNextGif() {
+  if (leftTurnTransitionPending) {
+    return;
+  }
+
   if (gifCount == 0) {
     return;
   }
@@ -440,7 +450,7 @@ void drawOrientationBadge() {
   gfx->print(orientationLabel(currentOrientation));
 }
 
-void applyDisplayOrientation(ScreenOrientation orientation, bool force) {
+void applyDisplayOrientation(ScreenOrientation orientation, bool force, bool reopenGif) {
   if (!force && orientation == currentOrientation) {
     return;
   }
@@ -453,7 +463,7 @@ void applyDisplayOrientation(ScreenOrientation orientation, bool force) {
   Serial.printf("Orientation -> %s (rotation=%u)\r\n", orientationLabel(currentOrientation),
                 displayRotationForOrientation(currentOrientation));
 
-  if (gifCount > 0) {
+  if (reopenGif && gifCount > 0) {
     openGifByIndex(currentGifIndex);
   } 
   // else {
@@ -461,8 +471,27 @@ void applyDisplayOrientation(ScreenOrientation orientation, bool force) {
   // }
 }
 
+bool startLeftTurnTransition(ScreenOrientation nextOrientation) {
+  const int turnLeftIndex = findGifIndexByName("/turnLeft.gif");
+  const int defaultIndex = findGifIndexByName("/default.gif");
+  if (turnLeftIndex < 0 || defaultIndex < 0) {
+    return false;
+  }
+
+  pendingOrientation = nextOrientation;
+  pendingDefaultGifIndex = defaultIndex;
+  leftTurnTransitionPending = true;
+  return openGifByIndex(static_cast<size_t>(turnLeftIndex));
+}
+
+bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to) {
+  const uint8_t fromValue = static_cast<uint8_t>(from);
+  const uint8_t toValue = static_cast<uint8_t>(to);
+  return static_cast<uint8_t>((fromValue + 1) % 4) == toValue;
+}
+
 void updateOrientationFromImu() {
-  if (!imuReady) {
+  if (!imuReady || leftTurnTransitionPending) {
     return;
   }
 
@@ -486,6 +515,12 @@ void updateOrientationFromImu() {
 
   if ((now - orientationChangedAtMs) < kOrientationSettleMs) {
     return;
+  }
+
+  if (isCounterClockwiseTurn(currentOrientation, nextOrientation)) {
+    if (startLeftTurnTransition(nextOrientation)) {
+      return;
+    }
   }
 
   applyDisplayOrientation(nextOrientation);
@@ -580,16 +615,16 @@ void initGifPlayer() {
   openGifByIndex(0);
 }
 
-}  // namespace
-
 int findGifIndexByName(const String &filename) {
   for (size_t i = 0; i < gifCount; i++) {
     if (gifPaths[i].endsWith(filename)) {
-      return i;
+      return static_cast<int>(i);
     }
   }
   return -1;
 }
+
+}  // namespace
 
 void setup() {
   waitForUsbSerial();
@@ -631,7 +666,15 @@ void loop() {
         Serial.printf("GIF decode error: %d\r\n", gif.getLastError());
         openGifByIndex(currentGifIndex);
       } else if (result == 0) {
-        if (gifPaths[currentGifIndex].endsWith("/wakeUp_240.gif")) {
+        if (leftTurnTransitionPending && gifPaths[currentGifIndex].endsWith("/turnLeft.gif")) {
+          leftTurnTransitionPending = false;
+          applyDisplayOrientation(pendingOrientation, false, false);
+          if (pendingDefaultGifIndex >= 0) {
+            openGifByIndex(static_cast<size_t>(pendingDefaultGifIndex));
+          } else {
+            restartCurrentGif();
+          }
+        } else if (gifPaths[currentGifIndex].endsWith("/wakeUp_240.gif")) {
           const int defaultIndex = findGifIndexByName("/default.gif");
 
           if (defaultIndex >= 0) {
