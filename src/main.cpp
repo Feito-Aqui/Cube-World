@@ -409,7 +409,7 @@ bool openGifByIndex(size_t index) {
   currentGifIndex = index;
   gifIsOpen = true;
   nextFrameAtMs = millis();
-  // clearFrameLayout();
+  clearFrameLayout();
   // drawOrientationBadge();
   return true;
 }
@@ -481,6 +481,7 @@ bool startLeftTurnTransition(ScreenOrientation nextOrientation) {
   pendingOrientation = nextOrientation;
   pendingDefaultGifIndex = defaultIndex;
   leftTurnTransitionPending = true;
+  // clearFrameLayout();
   return openGifByIndex(static_cast<size_t>(turnLeftIndex));
 }
 
@@ -668,7 +669,9 @@ void loop() {
       } else if (result == 0) {
         if (leftTurnTransitionPending && gifPaths[currentGifIndex].endsWith("/turnLeft.gif")) {
           leftTurnTransitionPending = false;
+          // gfx->fillScreen(WHITE);
           applyDisplayOrientation(pendingOrientation, false, false);
+          clearFrameLayout();
           if (pendingDefaultGifIndex >= 0) {
             openGifByIndex(static_cast<size_t>(pendingDefaultGifIndex));
           } else {
