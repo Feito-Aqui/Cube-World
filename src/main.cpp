@@ -72,7 +72,7 @@ size_t gifCount = 0;
 size_t currentGifIndex = 0;
 bool gifIsOpen = false;
 bool imuReady = false;
-bool leftTurnTransitionPending = false;
+bool turnTransitionPending = false;
 int16_t gifOffsetX = 0;
 int16_t gifOffsetY = 0;
 uint16_t lineBuffer[kLineBufferSize];
@@ -91,9 +91,10 @@ bool openGifByIndex(size_t index);
 void restartCurrentGif();
 void drawOrientationBadge();
 void applyDisplayOrientation(ScreenOrientation orientation, bool force = false, bool reopenGif = true);
-bool startLeftTurnTransition(ScreenOrientation nextOrientation);
+bool startTurnTransition(ScreenOrientation nextOrientation, const String &transitionGifName);
 int findGifIndexByName(const String &filename);
 bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
+bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 
 uint8_t displayRotationForOrientation(ScreenOrientation orientation) {
   switch (orientation) {
@@ -414,7 +415,7 @@ bool openGifByIndex(size_t index) {
 }
 
 void showNextGif() {
-  if (leftTurnTransitionPending) {
+  if (turnTransitionPending) {
     return;
   }
 
@@ -470,18 +471,18 @@ void applyDisplayOrientation(ScreenOrientation orientation, bool force, bool reo
   // }
 }
 
-bool startLeftTurnTransition(ScreenOrientation nextOrientation) {
-  const int turnLeftIndex = findGifIndexByName("/turnLeft.gif");
+bool startTurnTransition(ScreenOrientation nextOrientation, const String &transitionGifName) {
+  const int transitionGifIndex = findGifIndexByName(transitionGifName);
   const int defaultIndex = findGifIndexByName("/default.gif");
-  if (turnLeftIndex < 0 || defaultIndex < 0) {
+  if (transitionGifIndex < 0 || defaultIndex < 0) {
     return false;
   }
 
   pendingOrientation = nextOrientation;
   pendingDefaultGifIndex = defaultIndex;
-  leftTurnTransitionPending = true;
+  turnTransitionPending = true;
   clearFrameLayout();
-  return openGifByIndex(static_cast<size_t>(turnLeftIndex));
+  return openGifByIndex(static_cast<size_t>(transitionGifIndex));
 }
 
 bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to) {
@@ -490,8 +491,14 @@ bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to) {
   return static_cast<uint8_t>((fromValue + 1) % 4) == toValue;
 }
 
+bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to) {
+  const uint8_t fromValue = static_cast<uint8_t>(from);
+  const uint8_t toValue = static_cast<uint8_t>(to);
+  return static_cast<uint8_t>((fromValue + 3) % 4) == toValue;
+}
+
 void updateOrientationFromImu() {
-  if (!imuReady || leftTurnTransitionPending) {
+  if (!imuReady || turnTransitionPending) {
     return;
   }
 
@@ -518,7 +525,11 @@ void updateOrientationFromImu() {
   }
 
   if (isCounterClockwiseTurn(currentOrientation, nextOrientation)) {
-    if (startLeftTurnTransition(nextOrientation)) {
+    if (startTurnTransition(nextOrientation, "/turnLeft.gif")) {
+      return;
+    }
+  } else if (isClockwiseTurn(currentOrientation, nextOrientation)) {
+    if (startTurnTransition(nextOrientation, "/turnRight.gif")) {
       return;
     }
   }
@@ -667,8 +678,10 @@ void loop() {
         openGifByIndex(currentGifIndex);
       } 
       else if (result == 0) {
-        if (leftTurnTransitionPending && gifPaths[currentGifIndex].endsWith("/turnLeft.gif")) {
-          leftTurnTransitionPending = false;
+        if (turnTransitionPending &&
+            (gifPaths[currentGifIndex].endsWith("/turnLeft.gif") ||
+             gifPaths[currentGifIndex].endsWith("/turnRight.gif"))) {
+          turnTransitionPending = false;
           // gfx->fillScreen(WHITE);
           applyDisplayOrientation(pendingOrientation, false, false);
           clearFrameLayout();
