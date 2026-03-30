@@ -58,7 +58,7 @@ struct Rect {
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(kLcdDcPin, kLcdCsPin, kLcdSckPin, kLcdMosiPin);
 Arduino_GFX *gfx =
-    new Arduino_ST7789(bus, kLcdResetPin, 0, true, kPanelWidth, kPanelHeight, 0, 20, 0, 0);
+    new Arduino_ST7789(bus, kLcdResetPin, 0, true, kPanelWidth, kPanelHeight, 0, 20, 0, 20);
 
 std::shared_ptr<Arduino_IIC_DriveBus> i2cBus =
     std::make_shared<Arduino_HWIIC>(kTouchSdaPin, kTouchSclPin, &Wire);
@@ -150,13 +150,13 @@ int16_t displayLogicalHeight() {
 Rect blackBandRect() {
   switch (displayRotationForOrientation(currentOrientation)) {
     case 0:
-      return {kGifAreaSize, 0, kReservedBandSize, kPanelWidth};
+      return {0, kGifAreaSize, kGifAreaSize, kReservedBandSize};
     case 1:
-      return {0, kGifAreaSize, kPanelWidth, kReservedBandSize};
+      return {kGifAreaSize, 0, kReservedBandSize, kPanelWidth};
     case 2:
-      return {kReservedBandSize, 0, kGifAreaSize, kGifAreaSize};
+      return {0, 0, kGifAreaSize, kReservedBandSize};
     case 3:
-      return {0, kReservedBandSize, kGifAreaSize, kGifAreaSize};
+      return {0, 0, kReservedBandSize, kGifAreaSize};
   }
   return {0, 0, kPanelWidth, kReservedBandSize};
 }
@@ -176,9 +176,8 @@ Rect gifViewportRect() {
 }
 
 void clearFrameLayout() {
-  // gfx->fillScreen(BLACK);
   const Rect band = blackBandRect();
-  gfx->fillRect(band.x, band.y, band.w, band.h, BLACK);
+    gfx->fillRect(band.x, band.y, band.w, band.h, BLACK);
 }
 
 TouchPoint mapTouchToRotation(uint16_t rawX, uint16_t rawY) {
@@ -481,7 +480,7 @@ bool startLeftTurnTransition(ScreenOrientation nextOrientation) {
   pendingOrientation = nextOrientation;
   pendingDefaultGifIndex = defaultIndex;
   leftTurnTransitionPending = true;
-  // clearFrameLayout();
+  clearFrameLayout();
   return openGifByIndex(static_cast<size_t>(turnLeftIndex));
 }
 
@@ -666,7 +665,8 @@ void loop() {
       if (result < 0) {
         Serial.printf("GIF decode error: %d\r\n", gif.getLastError());
         openGifByIndex(currentGifIndex);
-      } else if (result == 0) {
+      } 
+      else if (result == 0) {
         if (leftTurnTransitionPending && gifPaths[currentGifIndex].endsWith("/turnLeft.gif")) {
           leftTurnTransitionPending = false;
           // gfx->fillScreen(WHITE);
@@ -677,7 +677,8 @@ void loop() {
           } else {
             restartCurrentGif();
           }
-        } else if (gifPaths[currentGifIndex].endsWith("/wakeUp_240.gif")) {
+        } 
+        else if (gifPaths[currentGifIndex].endsWith("/wakeUp_240.gif")) {
           const int defaultIndex = findGifIndexByName("/default.gif");
 
           if (defaultIndex >= 0) {
@@ -697,7 +698,7 @@ void loop() {
       // drawOrientationBadge();
     }
   }
-
+  Serial.println(orientationLabel(currentOrientation));
   delay(1);
   yield();
 }
