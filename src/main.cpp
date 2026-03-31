@@ -30,12 +30,12 @@ constexpr int kTouchSdaPin = 11;
 constexpr int kTouchResetPin = 13;
 constexpr int kTouchIntPin = 14;
 
-constexpr uint32_t kTouchDebounceMs = 250;
 constexpr uint32_t kImuPollIntervalMs = 120;
 constexpr uint32_t kOrientationSettleMs = 180;
 constexpr size_t kMaxGifFiles = 16;
 constexpr float kOrientationMagnitudeThreshold = 0.60f;
 constexpr float kOrientationDominanceMargin = 0.18f;
+constexpr uint8_t kDefaultGifWeight = 5;
 
 enum class ScreenOrientation : uint8_t {
   Portrait = 0,
@@ -62,7 +62,9 @@ Arduino_GFX *gfx =
 
 std::shared_ptr<Arduino_IIC_DriveBus> i2cBus =
     std::make_shared<Arduino_HWIIC>(kTouchSdaPin, kTouchSclPin, &Wire);
-std::unique_ptr<Arduino_IIC> touch;
+// Touch handling is intentionally disabled. GIF changes now come from the
+// routine random picker after each animation finishes.
+// std::unique_ptr<Arduino_IIC> touch;
 SensorQMI8658 imu;
 
 AnimatedGIF gif;
@@ -76,7 +78,6 @@ bool turnTransitionPending = false;
 int16_t gifOffsetX = 0;
 int16_t gifOffsetY = 0;
 uint16_t lineBuffer[kLineBufferSize];
-uint32_t lastTouchMs = 0;
 uint32_t nextFrameAtMs = 0;
 uint32_t lastImuPollMs = 0;
 uint32_t orientationChangedAtMs = 0;
@@ -84,7 +85,6 @@ ScreenOrientation currentOrientation = ScreenOrientation::Portrait;
 ScreenOrientation pendingOrientation = ScreenOrientation::Portrait;
 int pendingDefaultGifIndex = -1;
 
-void onTouchInterrupt();
 void gifDraw(GIFDRAW *draw);
 void closeCurrentGif();
 bool openGifByIndex(size_t index);
@@ -95,6 +95,9 @@ bool startTurnTransition(ScreenOrientation nextOrientation, const String &transi
 int findGifIndexByName(const String &filename);
 bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
+bool isTurnTransitionGif(const String &path);
+bool isRoutineSelectableGif(const String &path);
+int chooseNextRoutineGifIndex();
 
 uint8_t displayRotationForOrientation(ScreenOrientation orientation) {
   switch (orientation) {
@@ -287,19 +290,19 @@ void drawStatus(const char *line1, const char *line2 = nullptr) {
   }
 }
 
-void initTouch() {
-  touch.reset(new Arduino_CST816x(i2cBus, CST816T_DEVICE_ADDRESS, kTouchResetPin, kTouchIntPin,
-                                  onTouchInterrupt));
-
-  while (!touch->begin()) {
-    Serial.println("Waiting for CST816T...");
-    delay(500);
-  }
-
-  touch->IIC_Write_Device_State(
-      Arduino_IIC_Touch::Device::TOUCH_DEVICE_INTERRUPT_MODE,
-      Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC);
-}
+// void initTouch() {
+//   touch.reset(new Arduino_CST816x(i2cBus, CST816T_DEVICE_ADDRESS, kTouchResetPin, kTouchIntPin,
+//                                   onTouchInterrupt));
+//
+//   while (!touch->begin()) {
+//     Serial.println("Waiting for CST816T...");
+//     delay(500);
+//   }
+//
+//   touch->IIC_Write_Device_State(
+//       Arduino_IIC_Touch::Device::TOUCH_DEVICE_INTERRUPT_MODE,
+//       Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC);
+// }
 
 void initImu() {
   imuReady = imu.begin(Wire, QMI8658_L_SLAVE_ADDRESS, kTouchSdaPin, kTouchSclPin);
@@ -317,24 +320,6 @@ void initImu() {
   imu.enableAccelerometer();
 
   Serial.printf("QMI8658 ready, revision=0x%02X\r\n", imu.getChipID());
-}
-
-bool readTouchEvent() {
-  if (!touch || !touch->IIC_Interrupt_Flag) {
-    return false;
-  }
-
-  touch->IIC_Interrupt_Flag = false;
-
-  const uint16_t rawX = touch->IIC_Read_Device_Value(
-      Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
-  const uint16_t rawY = touch->IIC_Read_Device_Value(
-      Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
-  const TouchPoint rotated = mapTouchToRotation(rawX, rawY);
-
-  Serial.printf("Touch: raw=(%u,%u) mapped=(%u,%u) rot=%u\r\n", rawX, rawY, rotated.x, rotated.y,
-                static_cast<uint8_t>(currentOrientation));
-  return true;
 }
 
 bool hasGifExtension(const String &name) {
@@ -414,19 +399,6 @@ bool openGifByIndex(size_t index) {
   return true;
 }
 
-void showNextGif() {
-  if (turnTransitionPending) {
-    return;
-  }
-
-  if (gifCount == 0) {
-    return;
-  }
-
-  const size_t nextIndex = (currentGifIndex + 1) % gifCount;
-  openGifByIndex(nextIndex);
-}
-
 void restartCurrentGif() {
   if (!gifIsOpen) {
     return;
@@ -434,12 +406,6 @@ void restartCurrentGif() {
 
   gif.reset();
   nextFrameAtMs = millis();
-}
-
-void onTouchInterrupt() {
-  if (touch) {
-    touch->IIC_Interrupt_Flag = true;
-  }
 }
 
 void drawOrientationBadge() {
@@ -495,6 +461,54 @@ bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to) {
   const uint8_t fromValue = static_cast<uint8_t>(from);
   const uint8_t toValue = static_cast<uint8_t>(to);
   return static_cast<uint8_t>((fromValue + 3) % 4) == toValue;
+}
+
+bool isTurnTransitionGif(const String &path) {
+  return path.endsWith("/turnLeft.gif") || path.endsWith("/turnRight.gif");
+}
+
+bool isRoutineSelectableGif(const String &path) {
+  return !isTurnTransitionGif(path);
+}
+
+int chooseNextRoutineGifIndex() {
+  int defaultIndex = -1;
+  int totalWeight = 0;
+
+  for (size_t i = 0; i < gifCount; ++i) {
+    const String &path = gifPaths[i];
+    if (!isRoutineSelectableGif(path)) {
+      continue;
+    }
+
+    const bool isDefaultGif = path.endsWith("/default.gif");
+    if (isDefaultGif) {
+      defaultIndex = static_cast<int>(i);
+      totalWeight += kDefaultGifWeight;
+    } else {
+      totalWeight += 1;
+    }
+  }
+
+  if (totalWeight <= 0) {
+    return defaultIndex;
+  }
+
+  int draw = random(totalWeight);
+  for (size_t i = 0; i < gifCount; ++i) {
+    const String &path = gifPaths[i];
+    if (!isRoutineSelectableGif(path)) {
+      continue;
+    }
+
+    const int weight = path.endsWith("/default.gif") ? kDefaultGifWeight : 1;
+    if (draw < weight) {
+      return static_cast<int>(i);
+    }
+    draw -= weight;
+  }
+
+  return defaultIndex;
 }
 
 void updateOrientationFromImu() {
@@ -623,7 +637,18 @@ void initGifPlayer() {
     return;
   }
 
-  openGifByIndex(0);
+  const int defaultIndex = findGifIndexByName("/default.gif");
+  if (defaultIndex >= 0) {
+    openGifByIndex(static_cast<size_t>(defaultIndex));
+    return;
+  }
+
+  const int nextGifIndex = chooseNextRoutineGifIndex();
+  if (nextGifIndex >= 0) {
+    openGifByIndex(static_cast<size_t>(nextGifIndex));
+  } else {
+    openGifByIndex(0);
+  }
 }
 
 int findGifIndexByName(const String &filename) {
@@ -645,27 +670,20 @@ void setup() {
   digitalWrite(kLcdBacklightPin, HIGH);
 
   applyDisplayOrientation(ScreenOrientation::Portrait, true);
+  randomSeed(static_cast<uint32_t>(micros()));
 
   Serial.println();
-  Serial.println("Starting GIF touch demo");
+  Serial.println("Starting GIF random player");
 
-  initTouch();
+  // initTouch();
   initImu();
   initGifPlayer();
 
-  Serial.println("Ready: touch the screen to switch GIFs.");
+  Serial.println("Ready: GIFs advance automatically with weighted randomness.");
 }
 
 void loop() {
   updateOrientationFromImu();
-
-  if (readTouchEvent()) {
-    const uint32_t now = millis();
-    if ((now - lastTouchMs) >= kTouchDebounceMs) {
-      lastTouchMs = now;
-      showNextGif();
-    }
-  }
 
   if (gifIsOpen) {
     const uint32_t now = millis();
@@ -679,10 +697,8 @@ void loop() {
       } 
       else if (result == 0) {
         if (turnTransitionPending &&
-            (gifPaths[currentGifIndex].endsWith("/turnLeft.gif") ||
-             gifPaths[currentGifIndex].endsWith("/turnRight.gif"))) {
+            isTurnTransitionGif(gifPaths[currentGifIndex])) {
           turnTransitionPending = false;
-          // gfx->fillScreen(WHITE);
           applyDisplayOrientation(pendingOrientation, false, false);
           clearFrameLayout();
           if (pendingDefaultGifIndex >= 0) {
@@ -690,17 +706,13 @@ void loop() {
           } else {
             restartCurrentGif();
           }
-        } 
-        else if (gifPaths[currentGifIndex].endsWith("/wakeUp_240.gif")) {
-          const int defaultIndex = findGifIndexByName("/default.gif");
-
-          if (defaultIndex >= 0) {
-            openGifByIndex(static_cast<size_t>(defaultIndex));
+        } else {
+          const int nextGifIndex = chooseNextRoutineGifIndex();
+          if (nextGifIndex >= 0) {
+            openGifByIndex(static_cast<size_t>(nextGifIndex));
           } else {
             restartCurrentGif();
           }
-        } else {
-          restartCurrentGif();
         }
       } else {
         if (frameDelayMs < 10) {
