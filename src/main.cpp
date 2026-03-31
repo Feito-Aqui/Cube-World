@@ -8,6 +8,7 @@
 #include "AnimatedGIF.h"
 #include "Arduino_DriveBus_Library.h"
 #include "Arduino_GFX_Library.h"
+#include "proximity_espnow.h"
 #include "SensorQMI8658.hpp"
 
 namespace {
@@ -90,6 +91,7 @@ void closeCurrentGif();
 bool openGifByIndex(size_t index);
 void restartCurrentGif();
 void drawOrientationBadge();
+void drawProximityStatus();
 void applyDisplayOrientation(ScreenOrientation orientation, bool force = false, bool reopenGif = true);
 bool startTurnTransition(ScreenOrientation nextOrientation, const String &transitionGifName);
 int findGifIndexByName(const String &filename);
@@ -98,6 +100,9 @@ bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 bool isTurnTransitionGif(const String &path);
 bool isRoutineSelectableGif(const String &path);
 int chooseNextRoutineGifIndex();
+void initProximityFeature();
+void onNeighborNear(const proximity_espnow::NeighborInfo &neighbor);
+void onNeighborFar(const proximity_espnow::NeighborInfo &neighbor);
 
 uint8_t displayRotationForOrientation(ScreenOrientation orientation) {
   switch (orientation) {
@@ -416,6 +421,38 @@ void drawOrientationBadge() {
   gfx->print(orientationLabel(currentOrientation));
 }
 
+void drawProximityStatus() {
+  const Rect band = blackBandRect();
+  gfx->fillRect(band.x, band.y, band.w, band.h, BLACK);
+
+  if (!proximity_espnow::hasAnyNearNeighbor()) {
+    return;
+  }
+
+  proximity_espnow::NeighborInfo neighbors[PROXIMITY_ESPNOW_MAX_NEIGHBORS];
+  const size_t neighborCount = proximity_espnow::copyNeighbors(neighbors, PROXIMITY_ESPNOW_MAX_NEIGHBORS);
+
+  const proximity_espnow::NeighborInfo *bestNeighbor = nullptr;
+  for (size_t i = 0; i < neighborCount; ++i) {
+    const proximity_espnow::NeighborInfo &neighbor = neighbors[i];
+    if (neighbor.state != proximity_espnow::NeighborState::Near) {
+      continue;
+    }
+    if (!bestNeighbor || neighbor.averageRssi > bestNeighbor->averageRssi) {
+      bestNeighbor = &neighbor;
+    }
+  }
+
+  if (!bestNeighbor) {
+    return;
+  }
+
+  gfx->setTextColor(WHITE);
+  gfx->setTextSize(2);
+  gfx->setCursor(band.x + 8, band.y + ((band.h > 22) ? 12 : 2));
+  gfx->printf("RSSI %.0f", bestNeighbor->averageRssi);
+}
+
 void applyDisplayOrientation(ScreenOrientation orientation, bool force, bool reopenGif) {
   if (!force && orientation == currentOrientation) {
     return;
@@ -425,6 +462,7 @@ void applyDisplayOrientation(ScreenOrientation orientation, bool force, bool reo
   orientationChangedAtMs = millis();
   gfx->setRotation(displayRotationForOrientation(currentOrientation));
   clearFrameLayout();
+  drawProximityStatus();
 
   Serial.printf("Orientation -> %s (rotation=%u)\r\n", orientationLabel(currentOrientation),
                 displayRotationForOrientation(currentOrientation));
@@ -660,6 +698,38 @@ int findGifIndexByName(const String &filename) {
   return -1;
 }
 
+void initProximityFeature() {
+  if (!proximity_espnow::isBuildEnabled()) {
+    return;
+  }
+
+  proximity_espnow::setCallbacks(onNeighborNear, onNeighborFar);
+  if (!proximity_espnow::init()) {
+    Serial.println("Proximity ESP-NOW init failed.");
+    return;
+  }
+
+  Serial.printf("Proximity ESP-NOW ready, node_id=0x%08lX\r\n",
+                static_cast<unsigned long>(proximity_espnow::getLocalNodeId()));
+  drawProximityStatus();
+}
+
+void onNeighborNear(const proximity_espnow::NeighborInfo &neighbor) {
+  Serial.printf("Neighbor near: node=0x%08lX avg=%.1f last=%d mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                static_cast<unsigned long>(neighbor.nodeId), neighbor.averageRssi, neighbor.lastRssi,
+                neighbor.mac[0], neighbor.mac[1], neighbor.mac[2], neighbor.mac[3], neighbor.mac[4],
+                neighbor.mac[5]);
+  drawProximityStatus();
+}
+
+void onNeighborFar(const proximity_espnow::NeighborInfo &neighbor) {
+  Serial.printf("Neighbor far: node=0x%08lX avg=%.1f last=%d mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                static_cast<unsigned long>(neighbor.nodeId), neighbor.averageRssi, neighbor.lastRssi,
+                neighbor.mac[0], neighbor.mac[1], neighbor.mac[2], neighbor.mac[3], neighbor.mac[4],
+                neighbor.mac[5]);
+  drawProximityStatus();
+}
+
 }  // namespace
 
 void setup() {
@@ -678,12 +748,15 @@ void setup() {
   // initTouch();
   initImu();
   initGifPlayer();
+  initProximityFeature();
+  drawProximityStatus();
 
   Serial.println("Ready: GIFs advance automatically with weighted randomness.");
 }
 
 void loop() {
   updateOrientationFromImu();
+  proximity_espnow::update();
 
   if (gifIsOpen) {
     const uint32_t now = millis();
@@ -720,10 +793,10 @@ void loop() {
         }
         nextFrameAtMs = now + static_cast<uint32_t>(frameDelayMs);
       }
-      // drawOrientationBadge();
+      drawProximityStatus();
     }
   }
-  Serial.println(orientationLabel(currentOrientation));
+  // Serial.println(orientationLabel(currentOrientation));
   delay(1);
   yield();
 }
