@@ -400,6 +400,7 @@ class ProximityManager {
     }
 
     neighbor.nodeId = packet.nodeId;
+    neighbor.remoteUptimeMs = packet.uptimeMs;
     neighbor.flags = packet.flags;
     neighbor.lastSeq = packet.seq;
     neighbor.lastSeenMs = now;

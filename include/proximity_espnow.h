@@ -27,7 +27,7 @@
 #endif
 
 #ifndef PROXIMITY_ESPNOW_RSSI_NEAR_EXIT
-#define PROXIMITY_ESPNOW_RSSI_NEAR_EXIT -20
+#define PROXIMITY_ESPNOW_RSSI_NEAR_EXIT -30
 #endif
 
 #ifndef PROXIMITY_ESPNOW_MIN_NEAR_CONFIRMATIONS
@@ -50,6 +50,7 @@ struct NeighborInfo {
   bool active = false;
   uint8_t mac[6] = {0};
   uint32_t nodeId = 0;
+  uint32_t remoteUptimeMs = 0;
   int8_t lastRssi = -127;
   float averageRssi = -127.0f;
   uint32_t lastSeenMs = 0;

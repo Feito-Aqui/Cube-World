@@ -33,10 +33,16 @@ constexpr int kTouchIntPin = 14;
 
 constexpr uint32_t kImuPollIntervalMs = 120;
 constexpr uint32_t kOrientationSettleMs = 180;
+constexpr uint32_t kSynchronizedGifSlotMs = 4000;
+constexpr uint32_t kNearEffectWindowMs = 30000;
+constexpr uint32_t kNearEffectDurationMs = 10000;
+constexpr uint8_t kNearEffectChanceDivisor = 4;
 constexpr size_t kMaxGifFiles = 16;
 constexpr float kOrientationMagnitudeThreshold = 0.60f;
 constexpr float kOrientationDominanceMargin = 0.18f;
 constexpr uint8_t kDefaultGifWeight = 5;
+constexpr uint16_t kBroadcastGifValidMask = 0x8000U;
+constexpr uint16_t kBroadcastGifIndexMask = 0x001FU;
 
 enum class ScreenOrientation : uint8_t {
   Portrait = 0,
@@ -85,6 +91,14 @@ uint32_t orientationChangedAtMs = 0;
 ScreenOrientation currentOrientation = ScreenOrientation::Portrait;
 ScreenOrientation pendingOrientation = ScreenOrientation::Portrait;
 int pendingDefaultGifIndex = -1;
+uint32_t lastLoggedSyncLeaderNodeId = 0;
+uint32_t lastLoggedSyncSlot = 0;
+int lastLoggedSyncGifIndex = -1;
+bool hasLoggedSyncState = false;
+bool nearEffectWasActive = false;
+uint32_t lastLoggedNearEffectWindow = 0;
+uint32_t lastLoggedNearEffectLeaderNodeId = 0;
+bool hasLoggedNearEffectState = false;
 
 void gifDraw(GIFDRAW *draw);
 void closeCurrentGif();
@@ -99,7 +113,18 @@ bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 bool isTurnTransitionGif(const String &path);
 bool isRoutineSelectableGif(const String &path);
+void sortGifList();
 int chooseNextRoutineGifIndex();
+uint16_t encodeBroadcastGifFlags(int gifIndex);
+int decodeBroadcastGifIndex(uint16_t flags);
+void publishCurrentGifSelection();
+bool getNearEffectState(bool *activeOut, uint16_t *colorOut, uint32_t *leaderNodeIdOut = nullptr,
+                        uint32_t *windowOut = nullptr);
+void renderNearEffectIfNeeded();
+bool getSynchronizedRoutineGifIndex(size_t *indexOut);
+bool getSynchronizedRoutineGifIndex(size_t *indexOut, uint32_t *leaderNodeIdOut, uint32_t *slotOut,
+                                    uint32_t *timelineMsOut);
+void updateSynchronizedGifPlayback();
 void initProximityFeature();
 void onNeighborNear(const proximity_espnow::NeighborInfo &neighbor);
 void onNeighborFar(const proximity_espnow::NeighborInfo &neighbor);
@@ -356,6 +381,8 @@ void loadGifList() {
     }
     entry = root.openNextFile();
   }
+
+  sortGifList();
 }
 
 void closeCurrentGif() {
@@ -399,6 +426,7 @@ bool openGifByIndex(size_t index) {
   currentGifIndex = index;
   gifIsOpen = true;
   nextFrameAtMs = millis();
+  publishCurrentGifSelection();
   clearFrameLayout();
   // drawOrientationBadge();
   return true;
@@ -509,6 +537,27 @@ bool isRoutineSelectableGif(const String &path) {
   return !isTurnTransitionGif(path);
 }
 
+void sortGifList() {
+  for (size_t i = 0; i < gifCount; ++i) {
+    for (size_t j = i + 1; j < gifCount; ++j) {
+      if (gifPaths[j] < gifPaths[i]) {
+        const String temp = gifPaths[i];
+        gifPaths[i] = gifPaths[j];
+        gifPaths[j] = temp;
+      }
+    }
+  }
+}
+
+static uint32_t mixSyncValue(uint32_t value) {
+  value ^= value >> 16;
+  value *= 0x7FEB352DU;
+  value ^= value >> 15;
+  value *= 0x846CA68BU;
+  value ^= value >> 16;
+  return value;
+}
+
 int chooseNextRoutineGifIndex() {
   int defaultIndex = -1;
   int totalWeight = 0;
@@ -547,6 +596,250 @@ int chooseNextRoutineGifIndex() {
   }
 
   return defaultIndex;
+}
+
+uint16_t encodeBroadcastGifFlags(int gifIndex) {
+  if (gifIndex < 0 || gifIndex > static_cast<int>(kBroadcastGifIndexMask)) {
+    return 0;
+  }
+  return static_cast<uint16_t>(kBroadcastGifValidMask | (static_cast<uint16_t>(gifIndex) & kBroadcastGifIndexMask));
+}
+
+int decodeBroadcastGifIndex(uint16_t flags) {
+  if ((flags & kBroadcastGifValidMask) == 0) {
+    return -1;
+  }
+  return static_cast<int>(flags & kBroadcastGifIndexMask);
+}
+
+void publishCurrentGifSelection() {
+  if (!proximity_espnow::isRunning()) {
+    return;
+  }
+
+  const int gifIndex = gifIsOpen ? static_cast<int>(currentGifIndex) : -1;
+  const uint16_t encodedFlags = encodeBroadcastGifFlags(gifIndex);
+  proximity_espnow::setLocalFlags(encodedFlags);
+}
+
+bool getNearEffectState(bool *activeOut, uint16_t *colorOut, uint32_t *leaderNodeIdOut, uint32_t *windowOut) {
+  if (activeOut) {
+    *activeOut = false;
+  }
+  if (colorOut) {
+    *colorOut = BLACK;
+  }
+
+  if (!proximity_espnow::hasAnyNearNeighbor()) {
+    return false;
+  }
+
+  const uint32_t localNodeId = proximity_espnow::getLocalNodeId();
+  uint32_t leaderNodeId = localNodeId;
+  uint32_t timelineMs = millis();
+
+  proximity_espnow::NeighborInfo neighbors[PROXIMITY_ESPNOW_MAX_NEIGHBORS];
+  const size_t neighborCount = proximity_espnow::copyNeighbors(neighbors, PROXIMITY_ESPNOW_MAX_NEIGHBORS);
+  for (size_t i = 0; i < neighborCount; ++i) {
+    const proximity_espnow::NeighborInfo &neighbor = neighbors[i];
+    if (neighbor.state != proximity_espnow::NeighborState::Near) {
+      continue;
+    }
+
+    if (neighbor.nodeId < leaderNodeId) {
+      leaderNodeId = neighbor.nodeId;
+      timelineMs = neighbor.remoteUptimeMs + (millis() - neighbor.lastSeenMs);
+    }
+  }
+
+  const uint32_t effectWindow = timelineMs / kNearEffectWindowMs;
+  const uint32_t effectSeed = mixSyncValue(effectWindow ^ leaderNodeId ^ 0x51F15EEDUL);
+  const bool effectActive = (effectSeed % kNearEffectChanceDivisor) == 0 &&
+                            (timelineMs % kNearEffectWindowMs) < kNearEffectDurationMs;
+  const bool swapColors = (mixSyncValue(effectSeed ^ 0xA5A55A5AUL) & 0x01U) != 0;
+
+  if (leaderNodeIdOut) {
+    *leaderNodeIdOut = leaderNodeId;
+  }
+  if (windowOut) {
+    *windowOut = effectWindow;
+  }
+  if (activeOut) {
+    *activeOut = effectActive;
+  }
+  if (colorOut) {
+    const bool localGetsWhite = swapColors ? (localNodeId != leaderNodeId) : (localNodeId == leaderNodeId);
+    *colorOut = localGetsWhite ? WHITE : RED;
+  }
+  return true;
+}
+
+void renderNearEffectIfNeeded() {
+  bool effectActive = false;
+  uint16_t effectColor = BLACK;
+  uint32_t leaderNodeId = 0;
+  uint32_t effectWindow = 0;
+  if (!getNearEffectState(&effectActive, &effectColor, &leaderNodeId, &effectWindow)) {
+    if (nearEffectWasActive) {
+      nearEffectWasActive = false;
+      hasLoggedNearEffectState = false;
+      if (proximity_espnow::hasAnyNearNeighbor()) {
+        updateSynchronizedGifPlayback();
+      } else if (gifIsOpen) {
+        openGifByIndex(currentGifIndex);
+      }
+      drawProximityStatus();
+    }
+    return;
+  }
+
+  if (!hasLoggedNearEffectState || lastLoggedNearEffectWindow != effectWindow ||
+      lastLoggedNearEffectLeaderNodeId != leaderNodeId || nearEffectWasActive != effectActive) {
+    Serial.printf("[near-fx] leader=0x%08lX window=%lu active=%s role=%s\r\n",
+                  static_cast<unsigned long>(leaderNodeId), static_cast<unsigned long>(effectWindow),
+                  effectActive ? "yes" : "no", effectColor == WHITE ? "white" : "red");
+    lastLoggedNearEffectWindow = effectWindow;
+    lastLoggedNearEffectLeaderNodeId = leaderNodeId;
+    hasLoggedNearEffectState = true;
+  }
+
+  if (effectActive) {
+    if (!nearEffectWasActive) {
+      Serial.printf("[near-fx] starting 10s color screen: %s\r\n", effectColor == WHITE ? "white" : "red");
+    }
+    gfx->fillScreen(effectColor);
+    nearEffectWasActive = true;
+    return;
+  }
+
+  if (nearEffectWasActive) {
+    nearEffectWasActive = false;
+    Serial.println("[near-fx] ending color screen");
+    updateSynchronizedGifPlayback();
+    if (gifIsOpen) {
+      openGifByIndex(currentGifIndex);
+    }
+    drawProximityStatus();
+  }
+}
+
+bool getSynchronizedRoutineGifIndex(size_t *indexOut) {
+  return getSynchronizedRoutineGifIndex(indexOut, nullptr, nullptr, nullptr);
+}
+
+bool getSynchronizedRoutineGifIndex(size_t *indexOut, uint32_t *leaderNodeIdOut, uint32_t *slotOut,
+                                    uint32_t *timelineMsOut) {
+  if (!indexOut) {
+    return false;
+  }
+
+  const uint32_t localNodeId = proximity_espnow::getLocalNodeId();
+  uint32_t leaderNodeId = localNodeId;
+  uint32_t timelineMs = millis();
+  const proximity_espnow::NeighborInfo *leaderNeighbor = nullptr;
+
+  proximity_espnow::NeighborInfo neighbors[PROXIMITY_ESPNOW_MAX_NEIGHBORS];
+  const size_t neighborCount = proximity_espnow::copyNeighbors(neighbors, PROXIMITY_ESPNOW_MAX_NEIGHBORS);
+  for (size_t i = 0; i < neighborCount; ++i) {
+    const proximity_espnow::NeighborInfo &neighbor = neighbors[i];
+    if (neighbor.state != proximity_espnow::NeighborState::Near) {
+      continue;
+    }
+
+    if (neighbor.nodeId < leaderNodeId) {
+      leaderNodeId = neighbor.nodeId;
+      timelineMs = neighbor.remoteUptimeMs + (millis() - neighbor.lastSeenMs);
+      leaderNeighbor = &neighbor;
+    }
+  }
+
+  if (leaderNeighbor) {
+    const int advertisedGifIndex = decodeBroadcastGifIndex(leaderNeighbor->flags);
+    if (advertisedGifIndex >= 0 && advertisedGifIndex < static_cast<int>(gifCount)) {
+      *indexOut = static_cast<size_t>(advertisedGifIndex);
+      if (leaderNodeIdOut) {
+        *leaderNodeIdOut = leaderNodeId;
+      }
+      if (slotOut) {
+        *slotOut = timelineMs / kSynchronizedGifSlotMs;
+      }
+      if (timelineMsOut) {
+        *timelineMsOut = timelineMs;
+      }
+      return true;
+    }
+  }
+
+  size_t weightedPool[kMaxGifFiles * kDefaultGifWeight];
+  size_t weightedCount = 0;
+  for (size_t i = 0; i < gifCount && weightedCount < (kMaxGifFiles * kDefaultGifWeight); ++i) {
+    const String &path = gifPaths[i];
+    if (!isRoutineSelectableGif(path)) {
+      continue;
+    }
+
+    const size_t weight = path.endsWith("/default.gif") ? kDefaultGifWeight : 1;
+    for (size_t copy = 0; copy < weight && weightedCount < (kMaxGifFiles * kDefaultGifWeight); ++copy) {
+      weightedPool[weightedCount++] = i;
+    }
+  }
+
+  if (weightedCount == 0) {
+    return false;
+  }
+
+  const uint32_t slot = timelineMs / kSynchronizedGifSlotMs;
+  const uint32_t syncValue = mixSyncValue(slot ^ leaderNodeId);
+  *indexOut = weightedPool[syncValue % weightedCount];
+
+  if (leaderNodeIdOut) {
+    *leaderNodeIdOut = leaderNodeId;
+  }
+  if (slotOut) {
+    *slotOut = slot;
+  }
+  if (timelineMsOut) {
+    *timelineMsOut = timelineMs;
+  }
+  return true;
+}
+
+void updateSynchronizedGifPlayback() {
+  if (turnTransitionPending || !proximity_espnow::hasAnyNearNeighbor()) {
+    hasLoggedSyncState = false;
+    return;
+  }
+
+  bool nearEffectActive = false;
+  if (getNearEffectState(&nearEffectActive, nullptr) && nearEffectActive) {
+    return;
+  }
+
+  size_t syncedGifIndex = 0;
+  uint32_t leaderNodeId = 0;
+  uint32_t syncSlot = 0;
+  uint32_t timelineMs = 0;
+  if (!getSynchronizedRoutineGifIndex(&syncedGifIndex, &leaderNodeId, &syncSlot, &timelineMs)) {
+    return;
+  }
+
+  if (!hasLoggedSyncState || lastLoggedSyncLeaderNodeId != leaderNodeId || lastLoggedSyncSlot != syncSlot ||
+      lastLoggedSyncGifIndex != static_cast<int>(syncedGifIndex)) {
+    Serial.printf("[sync] leader=0x%08lX slot=%lu timeline=%lu gif=%s index=%u current=%u\r\n",
+                  static_cast<unsigned long>(leaderNodeId), static_cast<unsigned long>(syncSlot),
+                  static_cast<unsigned long>(timelineMs), gifPaths[syncedGifIndex].c_str(),
+                  static_cast<unsigned int>(syncedGifIndex), static_cast<unsigned int>(currentGifIndex));
+    lastLoggedSyncLeaderNodeId = leaderNodeId;
+    lastLoggedSyncSlot = syncSlot;
+    lastLoggedSyncGifIndex = static_cast<int>(syncedGifIndex);
+    hasLoggedSyncState = true;
+  }
+
+  if (!gifIsOpen || currentGifIndex != syncedGifIndex) {
+    Serial.printf("[sync] switching to synchronized gif=%s index=%u\r\n", gifPaths[syncedGifIndex].c_str(),
+                  static_cast<unsigned int>(syncedGifIndex));
+    openGifByIndex(syncedGifIndex);
+  }
 }
 
 void updateOrientationFromImu() {
@@ -711,22 +1004,26 @@ void initProximityFeature() {
 
   Serial.printf("Proximity ESP-NOW ready, node_id=0x%08lX\r\n",
                 static_cast<unsigned long>(proximity_espnow::getLocalNodeId()));
+  publishCurrentGifSelection();
   drawProximityStatus();
 }
 
 void onNeighborNear(const proximity_espnow::NeighborInfo &neighbor) {
-  Serial.printf("Neighbor near: node=0x%08lX avg=%.1f last=%d mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+  Serial.printf("Neighbor near: node=0x%08lX avg=%.1f last=%d remote_uptime=%lu flags=0x%04X mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
                 static_cast<unsigned long>(neighbor.nodeId), neighbor.averageRssi, neighbor.lastRssi,
-                neighbor.mac[0], neighbor.mac[1], neighbor.mac[2], neighbor.mac[3], neighbor.mac[4],
-                neighbor.mac[5]);
+                static_cast<unsigned long>(neighbor.remoteUptimeMs), static_cast<unsigned int>(neighbor.flags),
+                neighbor.mac[0], neighbor.mac[1], neighbor.mac[2], neighbor.mac[3], neighbor.mac[4], neighbor.mac[5]);
+  renderNearEffectIfNeeded();
+  updateSynchronizedGifPlayback();
   drawProximityStatus();
 }
 
 void onNeighborFar(const proximity_espnow::NeighborInfo &neighbor) {
-  Serial.printf("Neighbor far: node=0x%08lX avg=%.1f last=%d mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+  Serial.printf("Neighbor far: node=0x%08lX avg=%.1f last=%d remote_uptime=%lu flags=0x%04X mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
                 static_cast<unsigned long>(neighbor.nodeId), neighbor.averageRssi, neighbor.lastRssi,
-                neighbor.mac[0], neighbor.mac[1], neighbor.mac[2], neighbor.mac[3], neighbor.mac[4],
-                neighbor.mac[5]);
+                static_cast<unsigned long>(neighbor.remoteUptimeMs), static_cast<unsigned int>(neighbor.flags),
+                neighbor.mac[0], neighbor.mac[1], neighbor.mac[2], neighbor.mac[3], neighbor.mac[4], neighbor.mac[5]);
+  renderNearEffectIfNeeded();
   drawProximityStatus();
 }
 
@@ -737,7 +1034,8 @@ void setup() {
 
   gfx->begin();
   pinMode(kLcdBacklightPin, OUTPUT);
-  digitalWrite(kLcdBacklightPin, HIGH);
+  // digitalWrite(kLcdBacklightPin, HIGH);
+  analogWrite(kLcdBacklightPin, 170);
 
   applyDisplayOrientation(ScreenOrientation::Portrait, true);
   randomSeed(static_cast<uint32_t>(micros()));
@@ -757,8 +1055,10 @@ void setup() {
 void loop() {
   updateOrientationFromImu();
   proximity_espnow::update();
+  renderNearEffectIfNeeded();
+  updateSynchronizedGifPlayback();
 
-  if (gifIsOpen) {
+  if (gifIsOpen && !nearEffectWasActive) {
     const uint32_t now = millis();
     if (now >= nextFrameAtMs) {
       int frameDelayMs = 0;
@@ -780,11 +1080,15 @@ void loop() {
             restartCurrentGif();
           }
         } else {
-          const int nextGifIndex = chooseNextRoutineGifIndex();
-          if (nextGifIndex >= 0) {
-            openGifByIndex(static_cast<size_t>(nextGifIndex));
+          if (proximity_espnow::hasAnyNearNeighbor()) {
+            updateSynchronizedGifPlayback();
           } else {
-            restartCurrentGif();
+            const int nextGifIndex = chooseNextRoutineGifIndex();
+            if (nextGifIndex >= 0) {
+              openGifByIndex(static_cast<size_t>(nextGifIndex));
+            } else {
+              restartCurrentGif();
+            }
           }
         }
       } else {
