@@ -38,6 +38,10 @@
 #define PROXIMITY_ESPNOW_RSSI_ALPHA 0.35f
 #endif
 
+#ifndef PROXIMITY_ESPNOW_WIFI_CHANNEL
+#define PROXIMITY_ESPNOW_WIFI_CHANNEL 6
+#endif
+
 namespace proximity_espnow {
 
 enum class NeighborState : uint8_t {
@@ -69,6 +73,7 @@ struct Config {
   int8_t rssiNearExit = PROXIMITY_ESPNOW_RSSI_NEAR_EXIT;
   uint8_t minNearConfirmations = PROXIMITY_ESPNOW_MIN_NEAR_CONFIRMATIONS;
   float rssiAlpha = PROXIMITY_ESPNOW_RSSI_ALPHA;
+  uint8_t wifiChannel = PROXIMITY_ESPNOW_WIFI_CHANNEL;
 };
 
 using NeighborCallback = void (*)(const NeighborInfo &neighbor);

@@ -66,9 +66,19 @@ class ProximityManager {
     if (config_.rssiAlpha <= 0.0f || config_.rssiAlpha > 1.0f) {
       config_.rssiAlpha = PROXIMITY_ESPNOW_RSSI_ALPHA;
     }
+    if (config_.wifiChannel < 1 || config_.wifiChannel > 13) {
+      config_.wifiChannel = PROXIMITY_ESPNOW_WIFI_CHANNEL;
+    }
 
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+
+    const esp_err_t channelResult = esp_wifi_set_channel(config_.wifiChannel, WIFI_SECOND_CHAN_NONE);
+    if (channelResult != ESP_OK) {
+      Serial.printf("%sfailed to set WiFi channel=%u err=%d\r\n", kLogPrefix,
+                    static_cast<unsigned int>(config_.wifiChannel), static_cast<int>(channelResult));
+      return false;
+    }
 
     if (esp_wifi_get_mac(WIFI_IF_STA, localMac_) != ESP_OK) {
       Serial.printf("%sfailed to read local STA MAC\r\n", kLogPrefix);
@@ -87,7 +97,7 @@ class ProximityManager {
 
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, kBroadcastMac, sizeof(kBroadcastMac));
-    peerInfo.channel = 0;
+    peerInfo.channel = config_.wifiChannel;
     peerInfo.ifidx = WIFI_IF_STA;
     peerInfo.encrypt = false;
     const esp_err_t addPeerResult = esp_now_add_peer(&peerInfo);
@@ -114,6 +124,7 @@ class ProximityManager {
     Serial.printf("%senabled node_id=%08lX mac=%02X:%02X:%02X:%02X:%02X:%02X\r\n", kLogPrefix,
                   static_cast<unsigned long>(localNodeId_), localMac_[0], localMac_[1], localMac_[2],
                   localMac_[3], localMac_[4], localMac_[5]);
+    Serial.printf("%swifi_channel=%u\r\n", kLogPrefix, static_cast<unsigned int>(config_.wifiChannel));
     return true;
   }
 
