@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <DNSServer.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <Wire.h>
 
 #include <LittleFS.h>
@@ -33,16 +36,30 @@ constexpr int kTouchIntPin = 14;
 
 constexpr uint32_t kImuPollIntervalMs = 120;
 constexpr uint32_t kOrientationSettleMs = 180;
+constexpr uint32_t kDizzyTurnWindowMs = 20000;
 constexpr uint32_t kSynchronizedGifSlotMs = 4000;
 constexpr uint32_t kNearEffectWindowMs = 30000;
 constexpr uint32_t kNearEffectDurationMs = 10000;
 constexpr uint8_t kNearEffectChanceDivisor = 4;
+constexpr size_t kDizzyTurnThreshold = 4;
 constexpr size_t kMaxGifFiles = 16;
+constexpr size_t kManagedGifNameCount = 7;
 constexpr float kOrientationMagnitudeThreshold = 0.60f;
 constexpr float kOrientationDominanceMargin = 0.18f;
 constexpr uint8_t kDefaultGifWeight = 5;
 constexpr uint16_t kBroadcastGifValidMask = 0x8000U;
 constexpr uint16_t kBroadcastGifIndexMask = 0x001FU;
+constexpr uint32_t kTouchDebounceMs = 650;
+constexpr bool kAutostartMaintenanceOnBoot = true;
+constexpr uint8_t kDnsPort = 53;
+
+constexpr char kMaintenanceSsid[] = "CubeWorld-GIF";
+constexpr char kMaintenancePassword[] = "";
+
+const char *const kManagedGifNames[kManagedGifNameCount] = {
+    "default.gif",       "Scratch_head_240.gif", "Scratch_240.gif", "WakeUp_240.gif",
+    "Sleep_240.gif",     "turnleft.gif",         "turnRight.gif",
+};
 
 enum class ScreenOrientation : uint8_t {
   Portrait = 0,
@@ -69,13 +86,14 @@ Arduino_GFX *gfx =
 
 std::shared_ptr<Arduino_IIC_DriveBus> i2cBus =
     std::make_shared<Arduino_HWIIC>(kTouchSdaPin, kTouchSclPin, &Wire);
-// Touch handling is intentionally disabled. GIF changes now come from the
-// routine random picker after each animation finishes.
-// std::unique_ptr<Arduino_IIC> touch;
+std::unique_ptr<Arduino_IIC> touch;
 SensorQMI8658 imu;
+WebServer webServer(80);
+DNSServer dnsServer;
 
 AnimatedGIF gif;
 File gifFile;
+File uploadFile;
 String gifPaths[kMaxGifFiles];
 size_t gifCount = 0;
 size_t currentGifIndex = 0;
@@ -87,6 +105,7 @@ int16_t gifOffsetY = 0;
 uint16_t lineBuffer[kLineBufferSize];
 uint32_t nextFrameAtMs = 0;
 uint32_t lastImuPollMs = 0;
+uint32_t recentTurnStartedAtMs[kDizzyTurnThreshold] = {};
 uint32_t orientationChangedAtMs = 0;
 ScreenOrientation currentOrientation = ScreenOrientation::Portrait;
 ScreenOrientation pendingOrientation = ScreenOrientation::Portrait;
@@ -99,6 +118,12 @@ bool nearEffectWasActive = false;
 uint32_t lastLoggedNearEffectWindow = 0;
 uint32_t lastLoggedNearEffectLeaderNodeId = 0;
 bool hasLoggedNearEffectState = false;
+bool maintenanceModeActive = false;
+bool touchToggleRequested = false;
+uint32_t lastTouchToggleMs = 0;
+String lastMaintenanceMessage;
+String pendingUploadTargetPath;
+String pendingUploadError;
 
 void gifDraw(GIFDRAW *draw);
 void closeCurrentGif();
@@ -112,6 +137,7 @@ int findGifIndexByName(const String &filename);
 bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 bool isTurnTransitionGif(const String &path);
+bool isDizzyGif(const String &path);
 bool isRoutineSelectableGif(const String &path);
 void sortGifList();
 int chooseNextRoutineGifIndex();
@@ -128,6 +154,24 @@ void updateSynchronizedGifPlayback();
 void initProximityFeature();
 void onNeighborNear(const proximity_espnow::NeighborInfo &neighbor);
 void onNeighborFar(const proximity_espnow::NeighborInfo &neighbor);
+void onTouchInterrupt();
+void initTouch();
+bool isManagedGifPath(const String &path);
+String canonicalGifPath(const String &name);
+bool pathMatchesAnyGifAlias(const String &path, std::initializer_list<const char *> aliases);
+void removeLegacyAliasesForPath(const String &path);
+int findGifIndexByAnyName(std::initializer_list<const char *> aliases);
+void refreshGifListPreservingCurrent();
+void drawMaintenanceStatus();
+String maintenancePageHtml(const String &message = "");
+void handleMaintenanceRoot();
+void handleMaintenanceUpload();
+void handleMaintenanceUploadData();
+void handleCaptivePortalRedirect();
+bool redirectToCaptivePortal();
+bool startMaintenanceMode();
+void stopMaintenanceMode();
+void handleTouchToggle();
 
 uint8_t displayRotationForOrientation(ScreenOrientation orientation) {
   switch (orientation) {
@@ -211,7 +255,7 @@ Rect gifViewportRect() {
 
 void clearFrameLayout() {
   const Rect band = blackBandRect();
-    gfx->fillRect(band.x, band.y, band.w, band.h, BLACK);
+  gfx->fillRect(band.x, band.y, band.w, band.h, BLACK);
 }
 
 TouchPoint mapTouchToRotation(uint16_t rawX, uint16_t rawY) {
@@ -320,19 +364,38 @@ void drawStatus(const char *line1, const char *line2 = nullptr) {
   }
 }
 
-// void initTouch() {
-//   touch.reset(new Arduino_CST816x(i2cBus, CST816T_DEVICE_ADDRESS, kTouchResetPin, kTouchIntPin,
-//                                   onTouchInterrupt));
-//
-//   while (!touch->begin()) {
-//     Serial.println("Waiting for CST816T...");
-//     delay(500);
-//   }
-//
-//   touch->IIC_Write_Device_State(
-//       Arduino_IIC_Touch::Device::TOUCH_DEVICE_INTERRUPT_MODE,
-//       Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC);
-// }
+void onTouchInterrupt() {
+  touchToggleRequested = true;
+  if (touch) {
+    touch->IIC_Interrupt_Flag = true;
+  }
+}
+
+void initTouch() {
+  touch.reset(new Arduino_CST816x(i2cBus, CST816T_DEVICE_ADDRESS, kTouchResetPin, kTouchIntPin, onTouchInterrupt));
+
+  bool ready = false;
+  uint8_t attempts = 0;
+  while (attempts < 10) {
+    ready = touch->begin();
+    if (ready) {
+      break;
+    }
+    ++attempts;
+    Serial.println("Waiting for CST816T...");
+    delay(300);
+  }
+
+  if (!touch || !ready) {
+    Serial.println("CST816T not available, touch toggle disabled.");
+    touch.reset();
+    return;
+  }
+
+  touch->IIC_Write_Device_State(Arduino_IIC_Touch::Device::TOUCH_DEVICE_INTERRUPT_MODE,
+                                Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC);
+  Serial.printf("Touch ready, id=0x%02X\r\n", static_cast<unsigned int>(touch->IIC_Read_Device_ID()));
+}
 
 void initImu() {
   imuReady = imu.begin(Wire, QMI8658_L_SLAVE_ADDRESS, kTouchSdaPin, kTouchSclPin);
@@ -356,6 +419,43 @@ bool hasGifExtension(const String &name) {
   String lower = name;
   lower.toLowerCase();
   return lower.endsWith(".gif");
+}
+
+String canonicalGifPath(const String &name) {
+  if (name.startsWith("/")) {
+    return name;
+  }
+  return "/" + name;
+}
+
+bool isManagedGifPath(const String &path) {
+  for (size_t i = 0; i < kManagedGifNameCount; ++i) {
+    if (path.endsWith(canonicalGifPath(kManagedGifNames[i]))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool pathMatchesAnyGifAlias(const String &path, std::initializer_list<const char *> aliases) {
+  for (const char *alias : aliases) {
+    if (path.endsWith(canonicalGifPath(alias))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void removeLegacyAliasesForPath(const String &path) {
+  if (path.endsWith("/Scratch_head_240.gif")) {
+    LittleFS.remove("/Scratch Head_240.gif");
+  } else if (path.endsWith("/Scratch_240.gif")) {
+    LittleFS.remove("/Screcht_240.gif");
+  } else if (path.endsWith("/WakeUp_240.gif")) {
+    LittleFS.remove("/wakeUp_240.gif");
+  } else if (path.endsWith("/turnleft.gif")) {
+    LittleFS.remove("/turnLeft.gif");
+  }
 }
 
 void loadGifList() {
@@ -450,6 +550,11 @@ void drawOrientationBadge() {
 }
 
 void drawProximityStatus() {
+  if (maintenanceModeActive) {
+    drawMaintenanceStatus();
+    return;
+  }
+
   const Rect band = blackBandRect();
   gfx->fillRect(band.x, band.y, band.w, band.h, BLACK);
 
@@ -504,14 +609,40 @@ void applyDisplayOrientation(ScreenOrientation orientation, bool force, bool reo
 }
 
 bool startTurnTransition(ScreenOrientation nextOrientation, const String &transitionGifName) {
-  const int transitionGifIndex = findGifIndexByName(transitionGifName);
-  const int defaultIndex = findGifIndexByName("/default.gif");
+  int transitionGifIndex = -1;
+  if (transitionGifName.endsWith("turnLeft.gif")) {
+    transitionGifIndex = findGifIndexByAnyName({"turnleft.gif", "turnLeft.gif"});
+  } else if (transitionGifName.endsWith("turnRight.gif")) {
+    transitionGifIndex = findGifIndexByAnyName({"turnRight.gif"});
+  } else {
+    transitionGifIndex = findGifIndexByName(transitionGifName);
+  }
+
+  const int defaultIndex = findGifIndexByAnyName({"default.gif"});
   if (transitionGifIndex < 0 || defaultIndex < 0) {
     return false;
   }
 
+  const uint32_t now = millis();
+  for (size_t i = 0; i + 1 < kDizzyTurnThreshold; ++i) {
+    recentTurnStartedAtMs[i] = recentTurnStartedAtMs[i + 1];
+  }
+  recentTurnStartedAtMs[kDizzyTurnThreshold - 1] = now;
+
+  const uint32_t oldestTrackedTurnMs = recentTurnStartedAtMs[0];
+  const bool shouldUseDizzyGif =
+      oldestTrackedTurnMs != 0 && (now - oldestTrackedTurnMs) <= kDizzyTurnWindowMs;
+
+  int postTurnGifIndex = defaultIndex;
+  if (shouldUseDizzyGif) {
+    const int dizzyIndex = findGifIndexByAnyName({"dizzy_stickman.gif"});
+    if (dizzyIndex >= 0) {
+      postTurnGifIndex = dizzyIndex;
+    }
+  }
+
   pendingOrientation = nextOrientation;
-  pendingDefaultGifIndex = defaultIndex;
+  pendingDefaultGifIndex = postTurnGifIndex;
   turnTransitionPending = true;
   clearFrameLayout();
   return openGifByIndex(static_cast<size_t>(transitionGifIndex));
@@ -530,11 +661,15 @@ bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to) {
 }
 
 bool isTurnTransitionGif(const String &path) {
-  return path.endsWith("/turnLeft.gif") || path.endsWith("/turnRight.gif");
+  return pathMatchesAnyGifAlias(path, {"turnLeft.gif", "turnleft.gif", "turnRight.gif"});
+}
+
+bool isDizzyGif(const String &path) {
+  return pathMatchesAnyGifAlias(path, {"dizzy_stickman.gif"});
 }
 
 bool isRoutineSelectableGif(const String &path) {
-  return !isTurnTransitionGif(path);
+  return !isTurnTransitionGif(path) && !isDizzyGif(path);
 }
 
 void sortGifList() {
@@ -568,7 +703,7 @@ int chooseNextRoutineGifIndex() {
       continue;
     }
 
-    const bool isDefaultGif = path.endsWith("/default.gif");
+    const bool isDefaultGif = pathMatchesAnyGifAlias(path, {"default.gif"});
     if (isDefaultGif) {
       defaultIndex = static_cast<int>(i);
       totalWeight += kDefaultGifWeight;
@@ -588,7 +723,7 @@ int chooseNextRoutineGifIndex() {
       continue;
     }
 
-    const int weight = path.endsWith("/default.gif") ? kDefaultGifWeight : 1;
+    const int weight = pathMatchesAnyGifAlias(path, {"default.gif"}) ? kDefaultGifWeight : 1;
     if (draw < weight) {
       return static_cast<int>(i);
     }
@@ -778,7 +913,7 @@ bool getSynchronizedRoutineGifIndex(size_t *indexOut, uint32_t *leaderNodeIdOut,
       continue;
     }
 
-    const size_t weight = path.endsWith("/default.gif") ? kDefaultGifWeight : 1;
+    const size_t weight = pathMatchesAnyGifAlias(path, {"default.gif"}) ? kDefaultGifWeight : 1;
     for (size_t copy = 0; copy < weight && weightedCount < (kMaxGifFiles * kDefaultGifWeight); ++copy) {
       weightedPool[weightedCount++] = i;
     }
@@ -805,7 +940,7 @@ bool getSynchronizedRoutineGifIndex(size_t *indexOut, uint32_t *leaderNodeIdOut,
 }
 
 void updateSynchronizedGifPlayback() {
-  if (turnTransitionPending || !proximity_espnow::hasAnyNearNeighbor()) {
+  if (maintenanceModeActive || turnTransitionPending || !proximity_espnow::hasAnyNearNeighbor()) {
     hasLoggedSyncState = false;
     return;
   }
@@ -843,7 +978,7 @@ void updateSynchronizedGifPlayback() {
 }
 
 void updateOrientationFromImu() {
-  if (!imuReady || turnTransitionPending) {
+  if (!imuReady || turnTransitionPending || maintenanceModeActive) {
     return;
   }
 
@@ -968,7 +1103,7 @@ void initGifPlayer() {
     return;
   }
 
-  const int defaultIndex = findGifIndexByName("/default.gif");
+  const int defaultIndex = findGifIndexByAnyName({"default.gif"});
   if (defaultIndex >= 0) {
     openGifByIndex(static_cast<size_t>(defaultIndex));
     return;
@@ -989,6 +1124,37 @@ int findGifIndexByName(const String &filename) {
     }
   }
   return -1;
+}
+
+int findGifIndexByAnyName(std::initializer_list<const char *> aliases) {
+  for (const char *alias : aliases) {
+    for (size_t i = 0; i < gifCount; ++i) {
+      if (gifPaths[i].endsWith(canonicalGifPath(alias))) {
+        return static_cast<int>(i);
+      }
+    }
+  }
+  return -1;
+}
+
+void refreshGifListPreservingCurrent() {
+  String currentPath;
+  if (gifCount > 0 && currentGifIndex < gifCount) {
+    currentPath = gifPaths[currentGifIndex];
+  }
+
+  loadGifList();
+
+  if (!currentPath.isEmpty()) {
+    const int preservedIndex = findGifIndexByName(currentPath);
+    if (preservedIndex >= 0) {
+      currentGifIndex = static_cast<size_t>(preservedIndex);
+      return;
+    }
+  }
+
+  const int defaultIndex = findGifIndexByAnyName({"default.gif"});
+  currentGifIndex = (defaultIndex >= 0) ? static_cast<size_t>(defaultIndex) : 0;
 }
 
 void initProximityFeature() {
@@ -1027,6 +1193,290 @@ void onNeighborFar(const proximity_espnow::NeighborInfo &neighbor) {
   drawProximityStatus();
 }
 
+void drawMaintenanceStatus() {
+  const Rect band = blackBandRect();
+  gfx->fillRect(band.x, band.y, band.w, band.h, BLACK);
+  gfx->setTextColor(WHITE);
+  gfx->setTextSize(1);
+  gfx->setCursor(band.x + 6, band.y + 8);
+  gfx->print("PORTAL ");
+  gfx->print(WiFi.softAPIP());
+  gfx->setCursor(band.x + 6, band.y + 20);
+  gfx->print("SSID:");
+  gfx->print(kMaintenanceSsid);
+}
+
+String maintenancePageHtml(const String &message) {
+  String html;
+  html.reserve(8192);
+  html += F(
+      "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' "
+      "content='width=device-width,initial-scale=1'><title>Trocar GIF</title><style>"
+      ":root{--bg:#f6f2ea;--panel:#fffdf8;--ink:#1b1d1f;--muted:#6b7280;--accent:#0f766e;--line:#e7ddcf;--ok:#e8fbf2}"
+      "*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:18px;"
+      "font-family:Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#fbf8f1,#efe5d4);color:var(--ink)}"
+      ".card{width:min(100%,460px);background:var(--panel);border:1px solid var(--line);border-radius:24px;padding:24px;"
+      "box-shadow:0 20px 50px rgba(66,43,18,.12)}h1{margin:0 0 6px;font-size:32px}p{margin:0 0 18px;color:var(--muted);line-height:1.45}"
+      ".msg{background:var(--ok);border:1px solid #bce9d0;color:#0d5a3d;border-radius:14px;padding:12px 14px;margin-bottom:14px;font-weight:600}"
+      ".field{display:grid;gap:8px;margin-top:14px}.label{font-size:14px;font-weight:700}.select,.btn{width:100%;border-radius:16px;font-size:16px}"
+      ".select{padding:14px 16px;border:1px solid var(--line);background:#fff;color:var(--ink)}"
+      ".drop{display:grid;gap:6px;justify-items:center;text-align:center;padding:22px 16px;border:2px dashed var(--line);border-radius:20px;"
+      "background:#fcfaf5;cursor:pointer;transition:.18s ease}.drop.active{border-color:var(--accent);background:#f3fcfa}"
+      ".drop strong{font-size:18px}.drop span{font-size:14px;color:var(--muted)}input[type=file]{display:none}"
+      ".file{display:none;margin-top:10px;padding:12px 14px;border-radius:14px;background:#f5f7f8;border:1px solid #e7ecef;font-size:14px}"
+      ".file.show{display:block}.btn{margin-top:16px;padding:15px 18px;border:0;background:linear-gradient(135deg,#0f766e,#149b8f);color:#fff;font-weight:700;cursor:pointer}"
+      ".btn:disabled{opacity:.7}.status{margin-top:12px;min-height:20px;font-size:14px;color:var(--muted)}"
+      ".hint{margin-top:14px;text-align:center;font-size:13px;color:var(--muted)}"
+      "</style></head><body><main class='card'><h1>Trocar GIF</h1><p>Escolha o nome e envie um novo arquivo.</p>");
+
+  if (!message.isEmpty()) {
+    html += "<div class='msg'>";
+    html += message;
+    html += "</div>";
+  }
+
+  html += F("<form id='uploadForm' method='POST' action='/upload' enctype='multipart/form-data'>"
+            "<div class='field'><label class='label' for='target'>Arquivo de destino</label>"
+            "<select class='select' id='target' name='target'>");
+
+  for (size_t i = 0; i < kManagedGifNameCount; ++i) {
+    const String path = canonicalGifPath(kManagedGifNames[i]);
+    html += "<option value='";
+    html += kManagedGifNames[i];
+    html += "'>";
+    html += kManagedGifNames[i];
+    html += LittleFS.exists(path) ? " (presente)" : " (faltando)";
+    html += "</option>";
+  }
+
+  html += F("</select></div><div class='field'><label class='label'>Novo arquivo GIF</label>"
+            "<label class='drop' id='dropZone' for='gif'><strong>Selecionar GIF</strong>"
+            "<span>Toque aqui ou arraste um arquivo .gif</span></label>"
+            "<input id='gif' type='file' name='gif' accept='.gif,image/gif' required>"
+            "<div class='file' id='fileChip'><span id='fileName'>Nenhum arquivo selecionado</span></div></div>"
+            "<button type='submit' class='btn' id='submitBtn'>Enviar</button>"
+            "<div class='status' id='statusText'>Pronto para enviar.</div></form>"
+            "<div class='hint'>A tela fecha ao tocar novamente no dispositivo.</div></main><script>"
+            "const dropZone=document.getElementById('dropZone');"
+            "const fileInput=document.getElementById('gif');"
+            "const fileChip=document.getElementById('fileChip');"
+            "const fileName=document.getElementById('fileName');"
+            "const form=document.getElementById('uploadForm');"
+            "const statusText=document.getElementById('statusText');"
+            "const submitBtn=document.getElementById('submitBtn');"
+            "const target=document.getElementById('target');"
+            "function syncFile(){const file=fileInput.files&&fileInput.files[0];"
+            "if(!file){fileChip.classList.remove('show');fileName.textContent='Nenhum arquivo selecionado';statusText.textContent='Pronto para enviar.';return;}"
+            "fileChip.classList.add('show');fileName.textContent=file.name+' - '+Math.round(file.size/1024)+' KB';"
+            "statusText.textContent='Enviar para: '+target.value;}"
+            "['dragenter','dragover'].forEach(evt=>dropZone.addEventListener(evt,e=>{e.preventDefault();dropZone.classList.add('active');}));"
+            "['dragleave','drop'].forEach(evt=>dropZone.addEventListener(evt,e=>{e.preventDefault();dropZone.classList.remove('active');}));"
+            "dropZone.addEventListener('drop',e=>{if(e.dataTransfer.files.length){fileInput.files=e.dataTransfer.files;syncFile();}});"
+            "fileInput.addEventListener('change',syncFile);"
+            "target.addEventListener('change',()=>{if(fileInput.files&&fileInput.files[0]){statusText.textContent='Enviar para: '+target.value;}});"
+            "form.addEventListener('submit',e=>{const file=fileInput.files&&fileInput.files[0];"
+            "if(!file){e.preventDefault();statusText.textContent='Escolha um arquivo GIF antes de enviar.';return;}"
+            "submitBtn.disabled=true;submitBtn.textContent='Enviando...';statusText.textContent='Enviando para '+target.value+' ...';});"
+            "syncFile();</script></body></html>");
+  return html;
+}
+
+void handleMaintenanceRoot() {
+  webServer.send(200, "text/html; charset=utf-8", maintenancePageHtml(lastMaintenanceMessage));
+  lastMaintenanceMessage = "";
+}
+
+bool redirectToCaptivePortal() {
+  if (!maintenanceModeActive) {
+    return false;
+  }
+
+  const String hostHeader = webServer.hostHeader();
+  if (hostHeader.length() == 0 || hostHeader == WiFi.softAPIP().toString()) {
+    return false;
+  }
+
+  webServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+  webServer.send(302, "text/plain", "");
+  return true;
+}
+
+void handleCaptivePortalRedirect() {
+  if (redirectToCaptivePortal()) {
+    return;
+  }
+  handleMaintenanceRoot();
+}
+
+void handleMaintenanceUpload() {
+  const bool ok = pendingUploadError.isEmpty();
+  const String message = ok ? lastMaintenanceMessage : pendingUploadError;
+  webServer.send(200, "text/html; charset=utf-8", maintenancePageHtml(message));
+  pendingUploadError = "";
+}
+
+void handleMaintenanceUploadData() {
+  HTTPUpload &upload = webServer.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    pendingUploadError = "";
+    lastMaintenanceMessage = "";
+    pendingUploadTargetPath = canonicalGifPath(webServer.arg("target"));
+
+    if (!isManagedGifPath(pendingUploadTargetPath)) {
+      pendingUploadError = "Arquivo de destino invalido.";
+      return;
+    }
+
+    if (uploadFile) {
+      uploadFile.close();
+    }
+
+    LittleFS.remove(pendingUploadTargetPath);
+    removeLegacyAliasesForPath(pendingUploadTargetPath);
+    uploadFile = LittleFS.open(pendingUploadTargetPath, "w");
+    if (!uploadFile) {
+      pendingUploadError = "Nao foi possivel abrir o arquivo para escrita.";
+      return;
+    }
+
+    Serial.printf("[web] receiving %s\r\n", pendingUploadTargetPath.c_str());
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!pendingUploadError.isEmpty() || !uploadFile) {
+      return;
+    }
+
+    if (uploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      pendingUploadError = "Falha ao gravar o GIF na LittleFS.";
+      uploadFile.close();
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) {
+      uploadFile.close();
+    }
+
+    if (pendingUploadError.isEmpty()) {
+      refreshGifListPreservingCurrent();
+      lastMaintenanceMessage = "Upload concluido: " + pendingUploadTargetPath + " (" + String(upload.totalSize) + " bytes)";
+      Serial.printf("[web] saved %s (%u bytes)\r\n", pendingUploadTargetPath.c_str(),
+                    static_cast<unsigned int>(upload.totalSize));
+    }
+    drawMaintenanceStatus();
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (uploadFile) {
+      uploadFile.close();
+    }
+    pendingUploadError = "Upload interrompido.";
+    LittleFS.remove(pendingUploadTargetPath);
+  }
+}
+
+bool startMaintenanceMode() {
+  if (maintenanceModeActive) {
+    return true;
+  }
+
+  proximity_espnow::stop();
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAPsetHostname("cube-world-gif");
+
+  const bool apStarted =
+      (strlen(kMaintenancePassword) == 0) ? WiFi.softAP(kMaintenanceSsid) : WiFi.softAP(kMaintenanceSsid, kMaintenancePassword);
+  if (!apStarted) {
+    WiFi.mode(WIFI_OFF);
+    initProximityFeature();
+    lastMaintenanceMessage = "Falha ao iniciar o Wi-Fi.";
+    return false;
+  }
+
+  closeCurrentGif();
+  dnsServer.stop();
+  dnsServer.start(kDnsPort, "*", WiFi.softAPIP());
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  webServer.on("/", HTTP_GET, handleMaintenanceRoot);
+  webServer.on("/upload", HTTP_POST, handleMaintenanceUpload, handleMaintenanceUploadData);
+  webServer.on("/generate_204", HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/gen_204", HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/hotspot-detect.html", HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/library/test/success.html", HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/connecttest.txt", HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/redirect", HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/ncsi.txt", HTTP_GET, handleCaptivePortalRedirect);
+  webServer.on("/fwlink", HTTP_GET, handleCaptivePortalRedirect);
+  webServer.onNotFound(handleCaptivePortalRedirect);
+  webServer.begin();
+
+  maintenanceModeActive = true;
+  lastMaintenanceMessage = "Modo manutencao ativo. Conecte em " + String(kMaintenanceSsid) + " e abra " +
+                           WiFi.softAPIP().toString();
+  Serial.printf("[maintenance] web server started ssid=%s ip=http://%s/ channel=%d\r\n", kMaintenanceSsid,
+                WiFi.softAPIP().toString().c_str(), static_cast<int>(WiFi.channel()));
+  drawMaintenanceStatus();
+  return true;
+}
+
+void stopMaintenanceMode() {
+  if (!maintenanceModeActive) {
+    return;
+  }
+
+  dnsServer.stop();
+  webServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  maintenanceModeActive = false;
+  pendingUploadTargetPath = "";
+  pendingUploadError = "";
+  if (uploadFile) {
+    uploadFile.close();
+  }
+
+  refreshGifListPreservingCurrent();
+  if (gifCount > 0) {
+    openGifByIndex(currentGifIndex < gifCount ? currentGifIndex : 0);
+  }
+  initProximityFeature();
+  drawProximityStatus();
+  Serial.println("[maintenance] web server stopped");
+}
+
+void handleTouchToggle() {
+  if (!touchToggleRequested && (!touch || !touch->IIC_Interrupt_Flag)) {
+    return;
+  }
+
+  if (touch) {
+    touch->IIC_Interrupt_Flag = false;
+  }
+  touchToggleRequested = false;
+
+  const uint32_t now = millis();
+  if ((now - lastTouchToggleMs) < kTouchDebounceMs) {
+    return;
+  }
+  lastTouchToggleMs = now;
+
+  if (!maintenanceModeActive) {
+    if (startMaintenanceMode()) {
+      Serial.println("[maintenance] enabled by touch");
+    }
+    return;
+  }
+
+  stopMaintenanceMode();
+  Serial.println("[maintenance] disabled by touch");
+}
+
 }  // namespace
 
 void setup() {
@@ -1043,16 +1493,31 @@ void setup() {
   Serial.println();
   Serial.println("Starting GIF random player");
 
-  // initTouch();
+  initTouch();
   initImu();
   initGifPlayer();
   initProximityFeature();
   drawProximityStatus();
 
-  Serial.println("Ready: GIFs advance automatically with weighted randomness.");
+  if (kAutostartMaintenanceOnBoot) {
+    delay(400);
+    startMaintenanceMode();
+  }
+
+  Serial.println("Ready: 1 touch enters GIF web upload mode, 2nd touch exits.");
 }
 
 void loop() {
+  handleTouchToggle();
+
+  if (maintenanceModeActive) {
+    dnsServer.processNextRequest();
+    webServer.handleClient();
+    delay(2);
+    yield();
+    return;
+  }
+
   updateOrientationFromImu();
   proximity_espnow::update();
   renderNearEffectIfNeeded();
@@ -1076,6 +1541,7 @@ void loop() {
           clearFrameLayout();
           if (pendingDefaultGifIndex >= 0) {
             openGifByIndex(static_cast<size_t>(pendingDefaultGifIndex));
+            pendingDefaultGifIndex = -1;
           } else {
             restartCurrentGif();
           }
