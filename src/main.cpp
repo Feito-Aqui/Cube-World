@@ -43,7 +43,7 @@ constexpr uint32_t kNearEffectDurationMs = 10000;
 constexpr uint8_t kNearEffectChanceDivisor = 4;
 constexpr size_t kDizzyTurnThreshold = 4;
 constexpr size_t kMaxGifFiles = 16;
-constexpr size_t kManagedGifNameCount = 7;
+constexpr size_t kManagedGifNameCount = 8;
 constexpr float kOrientationMagnitudeThreshold = 0.60f;
 constexpr float kOrientationDominanceMargin = 0.18f;
 constexpr uint8_t kDefaultGifWeight = 5;
@@ -57,8 +57,8 @@ constexpr char kMaintenanceSsid[] = "CubeWorld-GIF";
 constexpr char kMaintenancePassword[] = "";
 
 const char *const kManagedGifNames[kManagedGifNameCount] = {
-    "default.gif",       "Scratch_head_240.gif", "Scratch_240.gif", "WakeUp_240.gif",
-    "Sleep_240.gif",     "turnleft.gif",         "turnRight.gif",
+    "default.gif",       "Scratch_head.gif", "Scratch.gif", "WakeUp_240.gif",
+    "Sleep_240.gif",     "turnleft.gif",         "turnRight.gif",   "fart.gif"
 };
 
 enum class ScreenOrientation : uint8_t {
@@ -138,6 +138,8 @@ bool isCounterClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 bool isClockwiseTurn(ScreenOrientation from, ScreenOrientation to);
 bool isTurnTransitionGif(const String &path);
 bool isDizzyGif(const String &path);
+bool isWakeUpGif(const String &path);
+bool isSleepGif(const String &path);
 bool isRoutineSelectableGif(const String &path);
 void sortGifList();
 int chooseNextRoutineGifIndex();
@@ -668,8 +670,16 @@ bool isDizzyGif(const String &path) {
   return pathMatchesAnyGifAlias(path, {"dizzy_stickman.gif"});
 }
 
+bool isWakeUpGif(const String &path) {
+  return pathMatchesAnyGifAlias(path, {"WakeUp_240.gif", "wakeUp_240.gif"});
+}
+
+bool isSleepGif(const String &path) {
+  return pathMatchesAnyGifAlias(path, {"Sleep_240.gif"});
+}
+
 bool isRoutineSelectableGif(const String &path) {
-  return !isTurnTransitionGif(path) && !isDizzyGif(path);
+  return !isTurnTransitionGif(path) && !isDizzyGif(path) && !isWakeUpGif(path);
 }
 
 void sortGifList() {
@@ -1100,6 +1110,12 @@ void initGifPlayer() {
   if (gifCount == 0) {
     Serial.println("No GIF files found in LittleFS");
     drawStatus("No GIFs found", "Use uploadfs");
+    return;
+  }
+
+  const int wakeUpIndex = findGifIndexByAnyName({"WakeUp_240.gif", "wakeUp_240.gif"});
+  if (wakeUpIndex >= 0) {
+    openGifByIndex(static_cast<size_t>(wakeUpIndex));
     return;
   }
 
@@ -1534,6 +1550,7 @@ void loop() {
         openGifByIndex(currentGifIndex);
       } 
       else if (result == 0) {
+        const bool finishedSleepGif = gifPaths[currentGifIndex].length() > 0 && isSleepGif(gifPaths[currentGifIndex]);
         if (turnTransitionPending &&
             isTurnTransitionGif(gifPaths[currentGifIndex])) {
           turnTransitionPending = false;
@@ -1544,6 +1561,18 @@ void loop() {
             pendingDefaultGifIndex = -1;
           } else {
             restartCurrentGif();
+          }
+        } else if (finishedSleepGif) {
+          const int wakeUpIndex = findGifIndexByAnyName({"WakeUp_240.gif", "wakeUp_240.gif"});
+          if (wakeUpIndex >= 0) {
+            openGifByIndex(static_cast<size_t>(wakeUpIndex));
+          } else {
+            const int nextGifIndex = chooseNextRoutineGifIndex();
+            if (nextGifIndex >= 0) {
+              openGifByIndex(static_cast<size_t>(nextGifIndex));
+            } else {
+              restartCurrentGif();
+            }
           }
         } else {
           if (proximity_espnow::hasAnyNearNeighbor()) {
