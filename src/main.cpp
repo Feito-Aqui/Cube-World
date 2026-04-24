@@ -50,7 +50,6 @@ constexpr uint8_t kDefaultGifWeight = 5;
 constexpr uint16_t kBroadcastGifValidMask = 0x8000U;
 constexpr uint16_t kBroadcastGifIndexMask = 0x001FU;
 constexpr uint32_t kTouchDebounceMs = 650;
-constexpr bool kAutostartMaintenanceOnBoot = true;
 constexpr uint8_t kDnsPort = 53;
 
 constexpr char kMaintenanceSsid[] = "CubeWorld-GIF";
@@ -158,6 +157,7 @@ void onNeighborNear(const proximity_espnow::NeighborInfo &neighbor);
 void onNeighborFar(const proximity_espnow::NeighborInfo &neighbor);
 void onTouchInterrupt();
 void initTouch();
+ScreenOrientation detectBootOrientation();
 bool isManagedGifPath(const String &path);
 String canonicalGifPath(const String &name);
 bool pathMatchesAnyGifAlias(const String &path, std::initializer_list<const char *> aliases);
@@ -396,6 +396,8 @@ void initTouch() {
 
   touch->IIC_Write_Device_State(Arduino_IIC_Touch::Device::TOUCH_DEVICE_INTERRUPT_MODE,
                                 Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC);
+  touch->IIC_Interrupt_Flag = false;
+  touchToggleRequested = false;
   Serial.printf("Touch ready, id=0x%02X\r\n", static_cast<unsigned int>(touch->IIC_Read_Device_ID()));
 }
 
@@ -415,6 +417,27 @@ void initImu() {
   imu.enableAccelerometer();
 
   Serial.printf("QMI8658 ready, revision=0x%02X\r\n", imu.getChipID());
+}
+
+ScreenOrientation detectBootOrientation() {
+  if (!imuReady) {
+    return currentOrientation;
+  }
+
+  constexpr uint8_t kBootOrientationSamples = 6;
+  ScreenOrientation lastStableOrientation = currentOrientation;
+
+  for (uint8_t sample = 0; sample < kBootOrientationSamples; ++sample) {
+    float accelX = 0.0f;
+    float accelY = 0.0f;
+    float accelZ = 0.0f;
+    if (imu.getAccelerometer(accelX, accelY, accelZ)) {
+      lastStableOrientation = detectOrientation(accelX, accelY);
+    }
+    delay(25);
+  }
+
+  return lastStableOrientation;
 }
 
 bool hasGifExtension(const String &name) {
@@ -1499,26 +1522,24 @@ void setup() {
   waitForUsbSerial();
 
   gfx->begin();
+  
+  
+  applyDisplayOrientation(ScreenOrientation::Portrait, true);
+  randomSeed(static_cast<uint32_t>(micros()));
+  
+  Serial.println();
+  Serial.println("Starting GIF random player");
+  
+  initTouch();
+  initImu();
+  applyDisplayOrientation(detectBootOrientation(), true);
   pinMode(kLcdBacklightPin, OUTPUT);
   // digitalWrite(kLcdBacklightPin, HIGH);
   analogWrite(kLcdBacklightPin, 170);
-
-  applyDisplayOrientation(ScreenOrientation::Portrait, true);
-  randomSeed(static_cast<uint32_t>(micros()));
-
-  Serial.println();
-  Serial.println("Starting GIF random player");
-
-  initTouch();
-  initImu();
   initGifPlayer();
   initProximityFeature();
   drawProximityStatus();
-
-  if (kAutostartMaintenanceOnBoot) {
-    delay(400);
-    startMaintenanceMode();
-  }
+  lastTouchToggleMs = millis();
 
   Serial.println("Ready: 1 touch enters GIF web upload mode, 2nd touch exits.");
 }
